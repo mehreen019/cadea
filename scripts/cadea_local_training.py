@@ -503,6 +503,25 @@ def main(args):
         config = Config()
         print("🚀 Using FULL configuration")
     
+    # Override config with command-line arguments
+    if args.en_samples is not None:
+        config.en_samples = args.en_samples
+        print(f"📝 Overriding EN samples: {config.en_samples}")
+    if args.bn_samples is not None:
+        config.bn_samples = args.bn_samples
+        print(f"📝 Overriding BN samples: {config.bn_samples}")
+    if args.ar_samples is not None:
+        config.ar_samples = args.ar_samples
+        print(f"📝 Overriding AR samples: {config.ar_samples}")
+    if args.batch_size is not None:
+        config.batch_size = args.batch_size
+        print(f"📝 Overriding batch size: {config.batch_size}")
+    
+    # Checkpointing control
+    enable_checkpointing = args.checkpointing == 'yes'
+    if not enable_checkpointing:
+        print("⚠️  Checkpointing DISABLED (running in no-checkpoint mode)")
+    
     # Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n{'='*80}")
@@ -589,28 +608,33 @@ def main(args):
     performance_tracking = {"after_en": {}, "after_bn": {}, "after_ar": {}}
     
     # Check for resume
-    checkpoint_manager.list_checkpoints()
+    if enable_checkpointing:
+        checkpoint_manager.list_checkpoints()
 
     # Determine resume point
     resume_stage = None
     resume_step = 0
-    latest_path = checkpoint_manager.checkpoint_dir / "latest.json"
+    
+    if enable_checkpointing:
+        latest_path = checkpoint_manager.checkpoint_dir / "latest.json"
 
-    if latest_path.exists():
-        with open(latest_path, 'r') as f:
-            metadata = json.load(f)
-        resume_stage = metadata.get('stage', '')
-        resume_step = metadata.get('step', 0)
-        print(f"\n📂 Found checkpoint: stage='{resume_stage}', step={resume_step}")
+        if latest_path.exists():
+            with open(latest_path, 'r') as f:
+                metadata = json.load(f)
+            resume_stage = metadata.get('stage', '')
+            resume_step = metadata.get('step', 0)
+            print(f"\n📂 Found checkpoint: stage='{resume_stage}', step={resume_step}")
 
-        # Determine which stages to skip
-        if resume_stage in ['ar_complete']:
-            print("✓ Training already complete! Nothing to do.")
-            return
-        elif resume_stage in ['bn_complete', 'ar']:
-            print("✓ Skipping EN and BN stages (already complete)")
-        elif resume_stage in ['en_complete', 'bn']:
-            print("✓ Skipping EN stage (already complete)")
+            # Determine which stages to skip
+            if resume_stage in ['ar_complete']:
+                print("✓ Training already complete! Nothing to do.")
+                return
+            elif resume_stage in ['bn_complete', 'ar']:
+                print("✓ Skipping EN and BN stages (already complete)")
+            elif resume_stage in ['en_complete', 'bn']:
+                print("✓ Skipping EN stage (already complete)")
+    else:
+        print("⏭️  Skipping checkpoint detection (checkpointing disabled)")
 
     # Stage 1: English (same as Kaggle version but with VRAM monitoring)
     skip_en = resume_stage in ['en_complete', 'bn', 'bn_complete', 'ar', 'ar_complete']
@@ -665,7 +689,7 @@ def main(args):
                 if step % config.vram_log_interval == 0:
                     vram_monitor.log(step)
 
-                if step > 0 and step % config.checkpoint_interval == 0:
+                if enable_checkpointing and step > 0 and step % config.checkpoint_interval == 0:
                     checkpoint_manager.save_checkpoint(
                         stage='en', step=step, model=model, optimizer=optimizer,
                         performance_tracking=performance_tracking
@@ -704,17 +728,20 @@ def main(args):
               f"Perplexity: {performance_tracking['after_en']['en_train']['perplexity']:.2f}")
 
         # Save post-English checkpoint
-        checkpoint_manager.save_checkpoint(
-            stage='en_complete',
-            step=len(en_dataloader),
-            model=model,
-            optimizer=optimizer,
-            scheduler=None,
-            metrics={},
-            conflict_history={},
-            training_metrics={},
-            performance_tracking=performance_tracking
-        )
+        if enable_checkpointing:
+            checkpoint_manager.save_checkpoint(
+                stage='en_complete',
+                step=len(en_dataloader),
+                model=model,
+                optimizer=optimizer,
+                scheduler=None,
+                metrics={},
+                conflict_history={},
+                training_metrics={},
+                performance_tracking=performance_tracking
+            )
+        else:
+            print("⏭️  Skipping checkpoint save (checkpointing disabled)")
 
         # Compute English baseline gradients
         print("\n" + "="*80)
@@ -753,9 +780,12 @@ def main(args):
         print(f"  Average loss: {np.mean(en_losses):.4f}")
 
         # Save baseline gradients
-        baseline_path = checkpoint_manager.checkpoint_dir / "english_baseline_grads.pt"
-        torch.save(english_baseline_grads, baseline_path)
-        print(f"✓ Baseline gradients saved: {baseline_path}")
+        if enable_checkpointing:
+            baseline_path = checkpoint_manager.checkpoint_dir / "english_baseline_grads.pt"
+            torch.save(english_baseline_grads, baseline_path)
+            print(f"✓ Baseline gradients saved: {baseline_path}")
+        else:
+            print("⏭️  Skipping baseline gradient save (checkpointing disabled)")
     else:
         # Load English baseline gradients from file
         baseline_path = checkpoint_manager.checkpoint_dir / "english_baseline_grads.pt"
@@ -1045,13 +1075,16 @@ def main(args):
         print(f"⚠️  EN Test Degradation: {en_test_degradation:+.1f}% (generalization loss)")
 
         # Save post-Bengali checkpoint
-        checkpoint_manager.save_checkpoint(
-            stage='bn_complete', step=config.total_steps, model=model, optimizer=optimizer,
-            scheduler=scheduler, conflict_history=conflict_history_bn,
-            training_metrics=training_metrics_bn,
-            performance_tracking=performance_tracking,
-            baseline_grads=english_baseline_grads
-        )
+        if enable_checkpointing:
+            checkpoint_manager.save_checkpoint(
+                stage='bn_complete', step=config.total_steps, model=model, optimizer=optimizer,
+                scheduler=scheduler, conflict_history=conflict_history_bn,
+                training_metrics=training_metrics_bn,
+                performance_tracking=performance_tracking,
+                baseline_grads=english_baseline_grads
+            )
+        else:
+            print("⏭️  Skipping checkpoint save (checkpointing disabled)")
 
         # ========================================================================
         # COMPUTE BENGALI BASELINE GRADIENT PROFILE
@@ -1092,9 +1125,12 @@ def main(args):
         print(f"  Average loss: {np.mean(bn_baseline_losses):.4f}")
 
         # Save Bengali baseline gradients
-        bn_baseline_path = checkpoint_manager.checkpoint_dir / "bengali_baseline_grads.pt"
-        torch.save(bengali_baseline_grads, bn_baseline_path)
-        print(f"✓ Bengali baseline gradients saved: {bn_baseline_path}")
+        if enable_checkpointing:
+            bn_baseline_path = checkpoint_manager.checkpoint_dir / "bengali_baseline_grads.pt"
+            torch.save(bengali_baseline_grads, bn_baseline_path)
+            print(f"✓ Bengali baseline gradients saved: {bn_baseline_path}")
+        else:
+            print("⏭️  Skipping baseline gradient save (checkpointing disabled)")
     else:
         # Load Bengali baseline gradients from file
         bn_baseline_path = checkpoint_manager.checkpoint_dir / "bengali_baseline_grads.pt"
@@ -1377,12 +1413,15 @@ def main(args):
               f"Perplexity: {performance_tracking['after_ar']['ar_train']['perplexity']:.2f}")
 
         # Save final checkpoint
-        checkpoint_manager.save_checkpoint(
-            stage='ar_complete', step=config.total_steps, model=model, optimizer=optimizer,
-            scheduler=scheduler, conflict_history=conflict_history_ar,
-            training_metrics=training_metrics_ar,
-            performance_tracking=performance_tracking
-        )
+        if enable_checkpointing:
+            checkpoint_manager.save_checkpoint(
+                stage='ar_complete', step=config.total_steps, model=model, optimizer=optimizer,
+                scheduler=scheduler, conflict_history=conflict_history_ar,
+                training_metrics=training_metrics_ar,
+                performance_tracking=performance_tracking
+            )
+        else:
+            print("⏭️  Skipping checkpoint save (checkpointing disabled)")
 
     # ========================================================================
     # COMBINED VISUALIZATION
@@ -1916,6 +1955,16 @@ if __name__ == "__main__":
     parser.add_argument("--stage", choices=['en', 'bn', 'ar', 'full'], default='full',
                        help="Training stage to run")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--checkpointing", choices=['yes', 'no'], default='yes',
+                       help="Enable/disable checkpointing (use 'no' for Kaggle/Colab)")
+    parser.add_argument("--en-samples", type=int, default=None,
+                       help="Number of English samples (overrides config)")
+    parser.add_argument("--bn-samples", type=int, default=None,
+                       help="Number of Bengali samples (overrides config)")
+    parser.add_argument("--ar-samples", type=int, default=None,
+                       help="Number of Arabic samples (overrides config)")
+    parser.add_argument("--batch-size", type=int, default=None,
+                       help="Batch size for training (overrides config)")
     args = parser.parse_args()
 
     main(args)
