@@ -1,0 +1,9 @@
+transformers==4.46.3
+torch
+datasets
+matplotlib
+numpy
+tqdm
+accelerate
+sentencepiece
+python-dotenv

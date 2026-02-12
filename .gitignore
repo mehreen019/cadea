@@ -1,1 +1,6 @@
 /.thesis
+.env
+*.pt
+*.json
+*/__pycache__
+.pytest_cache
