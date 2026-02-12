@@ -1018,7 +1018,7 @@ def main(args):
                 torch.cuda.empty_cache()
 
             # Checkpoint saving
-            if step > 0 and step % config.checkpoint_interval == 0:
+            if enable_checkpointing and step > 0 and step % config.checkpoint_interval == 0:
                 checkpoint_manager.save_checkpoint(
                     stage='bn', step=step, model=model, optimizer=optimizer,
                     scheduler=scheduler, conflict_history=conflict_history_bn,
@@ -1357,7 +1357,7 @@ def main(args):
                 torch.cuda.empty_cache()
 
             # Checkpoint saving
-            if step > 0 and step % config.checkpoint_interval == 0:
+            if enable_checkpointing and step > 0 and step % config.checkpoint_interval == 0:
                 checkpoint_manager.save_checkpoint(
                     stage='ar', step=step, model=model, optimizer=optimizer,
                     scheduler=scheduler, conflict_history=conflict_history_ar,
