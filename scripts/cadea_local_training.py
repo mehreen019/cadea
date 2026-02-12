@@ -57,7 +57,7 @@ class Config:
     
     # Datasets
     en_dataset = "tatsu-lab/alpaca"
-    en_samples = 100
+    en_samples = 2000  # Increased from 100 for statistically meaningful baseline
     bn_dataset = "md-nishat-008/Bangla-Instruct"
     bn_samples = 2000  # Reduced for 3060 Ti
     ar_dataset = "arbml/CIDAR"
@@ -70,7 +70,7 @@ class Config:
     
     # Monitoring
     layers_to_track = [0, 3, 6, 9, 12, 15]
-    log_interval = 50
+    log_interval = 100  # Reduced frequency to help with memory
     checkpoint_interval = 250  # Frequent saves
     vram_log_interval = 100  # Log VRAM usage
     total_steps = 1500  # Reduced for faster iteration
@@ -104,14 +104,14 @@ class CheckpointManager:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         print(f"📁 Checkpoint directory: {self.checkpoint_dir.absolute()}")
         
-    def save_checkpoint(self, stage, step, model, optimizer, scheduler=None, 
-                       metrics=None, conflict_history=None, training_metrics=None, 
-                       performance_tracking=None, baseline_grads=None):
-        """Save complete training state"""
+    def save_checkpoint(self, stage, step, model, optimizer, scheduler=None,
+                       metrics=None, conflict_history=None, training_metrics=None,
+                       performance_tracking=None, baseline_grads=None, keep_only_latest=True):
+        """Save complete training state and optionally clean up old checkpoints"""
         checkpoint_path = self.checkpoint_dir / f"{stage}_step_{step}.pt"
-        
+
         print(f"\n💾 Saving checkpoint: {checkpoint_path.name}")
-        
+
         checkpoint = {
             'stage': stage,
             'step': step,
@@ -125,9 +125,9 @@ class CheckpointManager:
             'performance_tracking': performance_tracking or {},
             'baseline_grads': baseline_grads
         }
-        
+
         torch.save(checkpoint, checkpoint_path)
-        
+
         # Save metadata
         metadata = {
             'stage': stage,
@@ -135,18 +135,44 @@ class CheckpointManager:
             'checkpoint_file': str(checkpoint_path),
             'timestamp': checkpoint['timestamp']
         }
-        
+
         with open(self.checkpoint_dir / f"{stage}_metadata.json", 'w') as f:
             json.dump(metadata, f, indent=2)
-        
+
         # Update latest
         with open(self.checkpoint_dir / "latest.json", 'w') as f:
             json.dump(metadata, f, indent=2)
-        
+
         size_mb = checkpoint_path.stat().st_size / 1e6
         print(f"✓ Checkpoint saved: {size_mb:.1f} MB")
-        
+
+        # Clean up old checkpoints for this stage (keep only latest)
+        if keep_only_latest:
+            self._cleanup_old_checkpoints(stage, checkpoint_path)
+
         return checkpoint_path
+
+    def _cleanup_old_checkpoints(self, stage, current_checkpoint_path):
+        """Delete old checkpoints for a stage, keeping only the current one"""
+        # Find all checkpoints for this stage (excluding _complete checkpoints)
+        pattern = f"{stage}_step_*.pt"
+        old_checkpoints = list(self.checkpoint_dir.glob(pattern))
+
+        deleted_count = 0
+        freed_mb = 0
+
+        for old_ckpt in old_checkpoints:
+            if old_ckpt != current_checkpoint_path and old_ckpt.exists():
+                size_mb = old_ckpt.stat().st_size / 1e6
+                try:
+                    old_ckpt.unlink()
+                    deleted_count += 1
+                    freed_mb += size_mb
+                except OSError as e:
+                    print(f"⚠️  Could not delete {old_ckpt.name}: {e}")
+
+        if deleted_count > 0:
+            print(f"🧹 Cleaned up {deleted_count} old checkpoint(s), freed {freed_mb:.1f} MB")
     
     def load_checkpoint(self, checkpoint_path=None, model=None, optimizer=None, scheduler=None):
         """Load training state"""
@@ -360,7 +386,8 @@ def extract_layer_gradients(model, batch, layers_to_track, device, tokenizer):
     for name, param in model.named_parameters():
         if param.grad is None:
             continue
-        if "model.layers." in name and ".mlp." in name:
+        # Track BOTH MLP and Attention layers (Fix #3: was missing ~40% of parameters)
+        if "model.layers." in name and (".mlp." in name or ".self_attn." in name):
             try:
                 layer_num = int(name.split("model.layers.")[1].split(".")[0])
                 if layer_num in layers_to_track:
@@ -374,13 +401,100 @@ def extract_layer_gradients(model, batch, layers_to_track, device, tokenizer):
             aggregated_grads[layer] = torch.cat(grads)
         else:
             aggregated_grads[layer] = torch.zeros(1, device=device)
-    
+
     return aggregated_grads, loss.item()
+
+
+def compute_current_task_gradient(model, dataloader, layers_to_track, device, tokenizer, num_batches=2):
+    """
+    Compute gradient for a task at CURRENT model state WITHOUT updating model.
+
+    This is the FIX for the static baseline problem - we compute what the comparison
+    task's gradient would be at the current model state, allowing us to measure
+    TRUE interference rather than comparing to a frozen snapshot.
+
+    MEMORY OPTIMIZED for 8GB VRAM:
+    - Uses only 2 batches (reduced from 5)
+    - Aggressive cache clearing between batches
+    - Handles OOM gracefully by returning None (caller should use static fallback)
+
+    Args:
+        model: The model to compute gradients for
+        dataloader: DataLoader for the comparison task
+        layers_to_track: Which layers to extract gradients from
+        device: Torch device
+        tokenizer: Tokenizer for the model
+        num_batches: Number of batches to average over (default 2 for memory)
+
+    Returns:
+        Dict mapping layer numbers to averaged gradient tensors (on GPU),
+        or None if OOM occurred (caller should fall back to static baseline for this step)
+    """
+    was_training = model.training
+
+    # Clear memory before starting
+    model.zero_grad()
+    torch.cuda.empty_cache()
+
+    try:
+        model.eval()
+
+        task_grads = {layer: [] for layer in layers_to_track}
+        batch_iter = iter(dataloader)
+
+        for i in range(min(num_batches, len(dataloader))):
+            try:
+                batch = next(batch_iter)
+            except StopIteration:
+                batch_iter = iter(dataloader)
+                batch = next(batch_iter)
+
+            layer_grads, _ = extract_layer_gradients(model, batch, layers_to_track, device, tokenizer)
+
+            if layer_grads is not None:
+                for layer, grad in layer_grads.items():
+                    if grad is not None and grad.numel() > 1:
+                        task_grads[layer].append(grad.clone())
+
+            # Aggressive cleanup after each batch
+            model.zero_grad()
+            del batch, layer_grads
+            torch.cuda.empty_cache()
+
+        # Average across batches
+        averaged_grads = {}
+        for layer, grads_list in task_grads.items():
+            if grads_list:
+                averaged_grads[layer] = torch.mean(torch.stack(grads_list), dim=0)
+            else:
+                averaged_grads[layer] = torch.zeros(1, device=device)
+
+        return averaged_grads
+
+    except torch.cuda.OutOfMemoryError:
+        # OOM - signal caller to use static baseline for THIS checkpoint only
+        print("\n⚠️  OOM in dynamic baseline, using static baseline for this step")
+        model.zero_grad()
+        torch.cuda.empty_cache()
+        gc.collect()
+        return None
+
+    finally:
+        if was_training:
+            model.train()
+        model.zero_grad()
+        torch.cuda.empty_cache()
+
 
 # ============================================================================
 # MAIN TRAINING FUNCTION
 # ============================================================================
 def main(args):
+    # Set seed for reproducibility
+    seed = args.seed
+    set_seed(seed)
+    print(f"🌱 Random seed set to: {seed}")
+
     # Select config
     if args.test:
         config = TestConfig()
@@ -446,14 +560,30 @@ def main(args):
     en_test = prepare_dataset(config.en_dataset, 50, config.max_length, tokenizer)
     bn_test = prepare_dataset(config.bn_dataset, 500, config.max_length, tokenizer)
     ar_test = prepare_dataset(config.ar_dataset, 500, config.max_length, tokenizer)
-    
+
     en_dataloader = DataLoader(en_dataset, batch_size=config.batch_size, shuffle=False)
     bn_dataloader = DataLoader(bn_dataset, batch_size=config.batch_size, shuffle=True)
     ar_dataloader = DataLoader(ar_dataset, batch_size=config.batch_size, shuffle=True)
-    
+
     en_test_loader = DataLoader(en_test, batch_size=config.batch_size, shuffle=False)
     bn_test_loader = DataLoader(bn_test, batch_size=config.batch_size, shuffle=False)
     ar_test_loader = DataLoader(ar_test, batch_size=config.batch_size, shuffle=False)
+
+    # Training subset loaders for TRUE forgetting measurement (Fix #6)
+    # Catastrophic forgetting = degradation on TRAINING data, not just test data
+    en_train_eval_size = min(200, len(en_dataset))
+    bn_train_eval_size = min(200, len(bn_dataset))
+    ar_train_eval_size = min(200, len(ar_dataset))
+
+    # Use Subset to get first N samples from training sets
+    from torch.utils.data import Subset
+    en_train_eval = Subset(en_dataset, range(en_train_eval_size))
+    bn_train_eval = Subset(bn_dataset, range(bn_train_eval_size))
+    ar_train_eval = Subset(ar_dataset, range(ar_train_eval_size))
+
+    en_train_eval_loader = DataLoader(en_train_eval, batch_size=config.batch_size, shuffle=False)
+    bn_train_eval_loader = DataLoader(bn_train_eval, batch_size=config.batch_size, shuffle=False)
+    ar_train_eval_loader = DataLoader(ar_train_eval, batch_size=config.batch_size, shuffle=False)
     
     # Initialize tracking
     performance_tracking = {"after_en": {}, "after_bn": {}, "after_ar": {}}
@@ -484,6 +614,8 @@ def main(args):
 
     # Stage 1: English (same as Kaggle version but with VRAM monitoring)
     skip_en = resume_stage in ['en_complete', 'bn', 'bn_complete', 'ar', 'ar_complete']
+    if args.stage in ['bn', 'ar']:
+        skip_en = True  # User requested to skip English
 
     if skip_en:
         print(f"\n{'='*80}")
@@ -558,11 +690,18 @@ def main(args):
         print("EVALUATION AFTER ENGLISH TRAINING")
         print("="*80)
 
-        performance_tracking["after_en"]["en"] = evaluate_on_test(
-            model, en_test_loader, "English", device, tokenizer
+        # Test set evaluation
+        performance_tracking["after_en"]["en_test"] = evaluate_on_test(
+            model, en_test_loader, "English Test", device, tokenizer
         )
-        print(f"EN Test - Loss: {performance_tracking['after_en']['en']['loss']:.4f}, "
-              f"Perplexity: {performance_tracking['after_en']['en']['perplexity']:.2f}")
+        # Training set evaluation (for true forgetting measurement)
+        performance_tracking["after_en"]["en_train"] = evaluate_on_test(
+            model, en_train_eval_loader, "English Train", device, tokenizer
+        )
+        print(f"EN Test  - Loss: {performance_tracking['after_en']['en_test']['loss']:.4f}, "
+              f"Perplexity: {performance_tracking['after_en']['en_test']['perplexity']:.2f}")
+        print(f"EN Train - Loss: {performance_tracking['after_en']['en_train']['loss']:.4f}, "
+              f"Perplexity: {performance_tracking['after_en']['en_train']['perplexity']:.2f}")
 
         # Save post-English checkpoint
         checkpoint_manager.save_checkpoint(
@@ -585,7 +724,7 @@ def main(args):
         english_baseline_grads = {layer: None for layer in config.layers_to_track}
         en_losses = []
 
-        num_baseline_batches = min(20, len(en_dataloader))
+        num_baseline_batches = min(100, len(en_dataloader))  # Increased for stable baseline
 
         for i, batch in enumerate(tqdm(en_dataloader, total=num_baseline_batches)):
             if i >= num_baseline_batches:
@@ -627,7 +766,7 @@ def main(args):
             print("⚠️  English baseline gradients not found, will recompute...")
             # Recompute if missing
             english_baseline_grads = {layer: None for layer in config.layers_to_track}
-            num_baseline_batches = min(20, len(en_dataloader))
+            num_baseline_batches = min(100, len(en_dataloader))  # Increased for stable baseline
             for i, batch in enumerate(tqdm(en_dataloader, total=num_baseline_batches, desc="Recomputing EN baseline")):
                 if i >= num_baseline_batches:
                     break
@@ -647,6 +786,10 @@ def main(args):
     # STAGE 2: BENGALI TRAINING WITH CONFLICT MONITORING
     # ========================================================================
     skip_bn = resume_stage in ['bn_complete', 'ar', 'ar_complete']
+    if args.stage == 'en':
+        skip_bn = True  # User only wants English
+    if args.stage == 'ar':
+        skip_bn = True  # User wants to skip to Arabic
 
     if skip_bn:
         print(f"\n{'='*80}")
@@ -662,7 +805,8 @@ def main(args):
     training_metrics_bn = {
         'steps': [],
         'losses': [],
-        'peak_conflict_layers': []
+        'peak_conflict_layers': [],
+        'skipped_steps_oom': []  # Track steps skipped due to OOM
     }
 
     if not skip_bn:
@@ -715,15 +859,16 @@ def main(args):
             loss.backward()
             accumulated_loss += loss.item()
 
-            # === CONFLICT MONITORING (extract gradients from CURRENT backward) ===
+            # === CONFLICT MONITORING (DYNAMIC BASELINE - computes EN grad at CURRENT model state) ===
             if step % config.log_interval == 0:
-                # Extract gradients directly from current backward pass
+                # Extract Bengali gradients directly from current backward pass
                 layer_grads = {}
                 for name, param in model.named_parameters():
                     if param.grad is None:
                         continue
 
-                    if ".layers." in name and ".mlp." in name:
+                    # Track BOTH MLP and Attention layers
+                    if ".layers." in name and (".mlp." in name or ".self_attn." in name):
                         try:
                             parts = name.split(".layers.")[1].split(".")
                             layer_num = int(parts[0])
@@ -741,13 +886,37 @@ def main(args):
                     if grads:
                         bn_layer_grads[layer] = torch.cat(grads)
 
-                # Compute cosine similarity with English baseline
+                # MEMORY FIX: Clear Bengali forward pass memory BEFORE computing English grads
+                del input_ids, attention_mask, labels, outputs, loss
+                model.zero_grad()
+                torch.cuda.empty_cache()
+
+                # CRITICAL FIX: Compute CURRENT English gradient at this model state
+                # This measures TRUE interference, not comparison to frozen snapshot
+                current_en_grads = compute_current_task_gradient(
+                    model, en_dataloader, config.layers_to_track, device, tokenizer, num_batches=2
+                )
+
+                # If OOM occurred, skip conflict logging for this step (don't use bad data)
+                if current_en_grads is None:
+                    training_metrics_bn['skipped_steps_oom'].append(step)
+                    accumulated_loss = 0
+                    continue
+
+                # Compute cosine similarity with DYNAMIC English baseline
                 layer_conflicts = {}
                 for layer in config.layers_to_track:
-                    if layer in bn_layer_grads and english_baseline_grads[layer] is not None:
+                    if layer in bn_layer_grads and layer in current_en_grads:
+                        en_grad = current_en_grads[layer]
+                        bn_grad = bn_layer_grads[layer]
+
+                        # Skip if either gradient is a placeholder
+                        if en_grad.numel() <= 1 or bn_grad.numel() <= 1:
+                            continue
+
                         # Normalize gradients
-                        en_grad_norm = F.normalize(english_baseline_grads[layer].unsqueeze(0), dim=1)
-                        bn_grad_norm = F.normalize(bn_layer_grads[layer].unsqueeze(0), dim=1)
+                        en_grad_norm = F.normalize(en_grad.unsqueeze(0), dim=1)
+                        bn_grad_norm = F.normalize(bn_grad.unsqueeze(0), dim=1)
 
                         # Cosine similarity
                         cos_sim = F.cosine_similarity(en_grad_norm, bn_grad_norm).item()
@@ -757,26 +926,42 @@ def main(args):
                             'step': step,
                             'cosine_similarity': cos_sim,
                             'conflict_score': 1 - cos_sim,
-                            'bn_grad_norm': bn_layer_grads[layer].norm().item(),
-                            'en_grad_norm': english_baseline_grads[layer].norm().item()
+                            'bn_grad_norm': bn_grad.norm().item(),
+                            'en_grad_norm': en_grad.norm().item()
                         })
 
                         layer_conflicts[layer] = 1 - cos_sim
 
-                # Find peak conflict layer
+                # Find peak conflict layer with significance testing
                 if layer_conflicts:
-                    peak_conflict_layer = max(layer_conflicts, key=layer_conflicts.get)
-                    training_metrics_bn['peak_conflict_layers'].append(peak_conflict_layer)
+                    # Sort conflicts by value
+                    sorted_conflicts = sorted(layer_conflicts.items(), key=lambda x: x[1], reverse=True)
+                    peak_layer, peak_val = sorted_conflicts[0]
+
+                    # Record peak and confidence
+                    if len(sorted_conflicts) > 1:
+                        second_layer, second_val = sorted_conflicts[1]
+                        peak_confidence = peak_val - second_val
+                    else:
+                        peak_confidence = peak_val
+
+                    training_metrics_bn['peak_conflict_layers'].append(peak_layer)
                     training_metrics_bn['steps'].append(step)
                     training_metrics_bn['losses'].append(accumulated_loss * config.gradient_accumulation)
+
+                    # Store confidence if tracking exists
+                    if 'peak_confidence' not in training_metrics_bn:
+                        training_metrics_bn['peak_confidence'] = []
+                    training_metrics_bn['peak_confidence'].append(peak_confidence)
 
                     accumulated_loss = 0
 
                     # Log
                     progress_bar.set_postfix({
                         'loss': f"{training_metrics_bn['losses'][-1]:.4f}",
-                        'peak_layer': peak_conflict_layer,
-                        'max_conflict': f"{max(layer_conflicts.values()):.3f}"
+                        'peak_layer': peak_layer,
+                        'max_conflict': f"{max(layer_conflicts.values()):.3f}",
+                        'confidence': f"{peak_confidence:.3f}"
                     })
 
             # Optimizer step every gradient_accumulation steps
@@ -815,27 +1000,49 @@ def main(args):
         progress_bar.close()
         print("\n✓ Bengali training complete")
 
+        # Report any skipped steps
+        if training_metrics_bn['skipped_steps_oom']:
+            print(f"⚠️  {len(training_metrics_bn['skipped_steps_oom'])} conflict logging steps skipped due to OOM")
+            print(f"   Skipped at steps: {training_metrics_bn['skipped_steps_oom']}")
+
         # Evaluate after Bengali
         print("\n" + "="*80)
         print("EVALUATION AFTER BENGALI TRAINING")
         print("="*80)
 
-        performance_tracking["after_bn"]["en"] = evaluate_on_test(
-            model, en_test_loader, "English", device, tokenizer
+        # Test set evaluations
+        performance_tracking["after_bn"]["en_test"] = evaluate_on_test(
+            model, en_test_loader, "English Test", device, tokenizer
         )
-        performance_tracking["after_bn"]["bn"] = evaluate_on_test(
-            model, bn_test_loader, "Bengali", device, tokenizer
+        performance_tracking["after_bn"]["bn_test"] = evaluate_on_test(
+            model, bn_test_loader, "Bengali Test", device, tokenizer
+        )
+        # Training set evaluations (for true forgetting measurement)
+        performance_tracking["after_bn"]["en_train"] = evaluate_on_test(
+            model, en_train_eval_loader, "English Train", device, tokenizer
+        )
+        performance_tracking["after_bn"]["bn_train"] = evaluate_on_test(
+            model, bn_train_eval_loader, "Bengali Train", device, tokenizer
         )
 
-        print(f"EN Test - Loss: {performance_tracking['after_bn']['en']['loss']:.4f}, "
-              f"Perplexity: {performance_tracking['after_bn']['en']['perplexity']:.2f}")
-        print(f"BN Test - Loss: {performance_tracking['after_bn']['bn']['loss']:.4f}, "
-              f"Perplexity: {performance_tracking['after_bn']['bn']['perplexity']:.2f}")
+        print(f"EN Test  - Loss: {performance_tracking['after_bn']['en_test']['loss']:.4f}, "
+              f"Perplexity: {performance_tracking['after_bn']['en_test']['perplexity']:.2f}")
+        print(f"EN Train - Loss: {performance_tracking['after_bn']['en_train']['loss']:.4f}, "
+              f"Perplexity: {performance_tracking['after_bn']['en_train']['perplexity']:.2f}")
+        print(f"BN Test  - Loss: {performance_tracking['after_bn']['bn_test']['loss']:.4f}, "
+              f"Perplexity: {performance_tracking['after_bn']['bn_test']['perplexity']:.2f}")
+        print(f"BN Train - Loss: {performance_tracking['after_bn']['bn_train']['loss']:.4f}, "
+              f"Perplexity: {performance_tracking['after_bn']['bn_train']['perplexity']:.2f}")
 
-        en_degradation = ((performance_tracking['after_bn']['en']['perplexity'] -
-                           performance_tracking['after_en']['en']['perplexity']) /
-                          performance_tracking['after_en']['en']['perplexity']) * 100
-        print(f"\n⚠️  EN Performance Degradation: {en_degradation:+.1f}%")
+        # Calculate forgetting on TRAINING set (true catastrophic forgetting)
+        en_train_degradation = ((performance_tracking['after_bn']['en_train']['perplexity'] -
+                                  performance_tracking['after_en']['en_train']['perplexity']) /
+                                 performance_tracking['after_en']['en_train']['perplexity']) * 100
+        en_test_degradation = ((performance_tracking['after_bn']['en_test']['perplexity'] -
+                                 performance_tracking['after_en']['en_test']['perplexity']) /
+                                performance_tracking['after_en']['en_test']['perplexity']) * 100
+        print(f"\n⚠️  EN Train Forgetting: {en_train_degradation:+.1f}% (TRUE catastrophic forgetting)")
+        print(f"⚠️  EN Test Degradation: {en_test_degradation:+.1f}% (generalization loss)")
 
         # Save post-Bengali checkpoint
         checkpoint_manager.save_checkpoint(
@@ -856,7 +1063,7 @@ def main(args):
         bengali_baseline_grads = {layer: None for layer in config.layers_to_track}
         bn_baseline_losses = []
 
-        num_baseline_batches = min(20, len(bn_dataloader))
+        num_baseline_batches = min(100, len(bn_dataloader))  # Increased for stable baseline
 
         for i, batch in enumerate(tqdm(bn_dataloader, total=num_baseline_batches, desc="Bengali baseline")):
             if i >= num_baseline_batches:
@@ -897,7 +1104,7 @@ def main(args):
         else:
             print("⚠️  Bengali baseline gradients not found, will recompute...")
             bengali_baseline_grads = {layer: None for layer in config.layers_to_track}
-            num_baseline_batches = min(20, len(bn_dataloader))
+            num_baseline_batches = min(100, len(bn_dataloader))  # Increased for stable baseline
             for i, batch in enumerate(tqdm(bn_dataloader, total=num_baseline_batches, desc="Recomputing BN baseline")):
                 if i >= num_baseline_batches:
                     break
@@ -916,195 +1123,266 @@ def main(args):
     # ========================================================================
     # STAGE 3: ARABIC TRAINING WITH CONFLICT MONITORING
     # ========================================================================
-    print(f"\n{'='*80}")
-    print("STAGE 3: ARABIC TRAINING WITH CONFLICT MONITORING (vs Bengali baseline)")
-    print(f"{'='*80}")
+    skip_ar = args.stage in ['en', 'bn']
+    if skip_ar:
+        print(f"\n{'='*80}")
+        print("STAGE 3: ARABIC TRAINING - SKIPPED (--stage flag)")
+        print(f"{'='*80}")
+    else:
+        print(f"\n{'='*80}")
+        print("STAGE 3: ARABIC TRAINING WITH CONFLICT MONITORING (vs Bengali baseline)")
+        print(f"{'='*80}")
 
-    # RE-INITIALIZE optimizer (fresh training phase)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=50,
-        num_training_steps=config.total_steps
-    )
-
-    # Tracking structures
+    # Tracking structures (needed even when skipping for export)
     conflict_history_ar = {layer: [] for layer in config.layers_to_track}
     training_metrics_ar = {
         'steps': [],
         'losses': [],
-        'peak_conflict_layers': []
+        'peak_conflict_layers': [],
+        'skipped_steps_oom': []  # Track steps skipped due to OOM
     }
 
-    # Training loop
-    ar_dataloader_iter = iter(ar_dataloader)
-    step = 0
-    accumulated_loss = 0
-
-    print(f"Training on Arabic for {config.total_steps} steps (logging every {config.log_interval})...")
-
-    progress_bar = tqdm(total=config.total_steps, desc="Arabic training")
-
-    while step < config.total_steps:
-        # Get next batch (cycle through dataset if needed)
-        try:
-            batch = next(ar_dataloader_iter)
-        except StopIteration:
-            ar_dataloader_iter = iter(ar_dataloader)
-            batch = next(ar_dataloader_iter)
-
-        # Forward and backward
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = input_ids.clone()
-        labels[labels == tokenizer.pad_token_id] = -100
-
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels
+    if not skip_ar:
+        # RE-INITIALIZE optimizer (fresh training phase)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=50,
+            num_training_steps=config.total_steps
         )
 
-        loss = outputs.loss / config.gradient_accumulation
+        # Training loop
+        ar_dataloader_iter = iter(ar_dataloader)
+        step = 0
+        accumulated_loss = 0
 
-        # Check for NaN loss before backward
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"\nWARNING: NaN loss at step {step}, skipping batch")
-            step += 1
-            progress_bar.update(1)
-            continue
+        print(f"Training on Arabic for {config.total_steps} steps (logging every {config.log_interval})...")
 
-        loss.backward()
-        accumulated_loss += loss.item()
+        progress_bar = tqdm(total=config.total_steps, desc="Arabic training")
 
-        # === CONFLICT MONITORING (extract gradients from CURRENT backward) ===
-        if step % config.log_interval == 0:
-            # Extract gradients directly from current backward pass
-            layer_grads = {}
-            for name, param in model.named_parameters():
-                if param.grad is None:
-                    continue
+        while step < config.total_steps:
+            # Get next batch (cycle through dataset if needed)
+            try:
+                batch = next(ar_dataloader_iter)
+            except StopIteration:
+                ar_dataloader_iter = iter(ar_dataloader)
+                batch = next(ar_dataloader_iter)
 
-                if ".layers." in name and ".mlp." in name:
-                    try:
-                        parts = name.split(".layers.")[1].split(".")
-                        layer_num = int(parts[0])
+            # Forward and backward
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = input_ids.clone()
+            labels[labels == tokenizer.pad_token_id] = -100
 
-                        if layer_num in config.layers_to_track:
-                            if layer_num not in layer_grads:
-                                layer_grads[layer_num] = []
-                            layer_grads[layer_num].append(param.grad.detach().clone().flatten())
-                    except (IndexError, ValueError):
-                        continue
-
-            # Concatenate gradients per layer
-            ar_layer_grads = {}
-            for layer, grads in layer_grads.items():
-                if grads:
-                    ar_layer_grads[layer] = torch.cat(grads)
-
-            # Compute cosine similarity with BENGALI baseline
-            layer_conflicts = {}
-            for layer in config.layers_to_track:
-                if layer in ar_layer_grads and bengali_baseline_grads[layer] is not None:
-                    # Normalize gradients
-                    bn_grad_norm = F.normalize(bengali_baseline_grads[layer].unsqueeze(0), dim=1)
-                    ar_grad_norm = F.normalize(ar_layer_grads[layer].unsqueeze(0), dim=1)
-
-                    # Cosine similarity
-                    cos_sim = F.cosine_similarity(bn_grad_norm, ar_grad_norm).item()
-
-                    # Store conflict metrics
-                    conflict_history_ar[layer].append({
-                        'step': step,
-                        'cosine_similarity': cos_sim,
-                        'conflict_score': 1 - cos_sim,
-                        'ar_grad_norm': ar_layer_grads[layer].norm().item(),
-                        'bn_grad_norm': bengali_baseline_grads[layer].norm().item()
-                    })
-
-                    layer_conflicts[layer] = 1 - cos_sim
-
-            # Find peak conflict layer
-            if layer_conflicts:
-                peak_conflict_layer = max(layer_conflicts, key=layer_conflicts.get)
-                training_metrics_ar['peak_conflict_layers'].append(peak_conflict_layer)
-                training_metrics_ar['steps'].append(step)
-                training_metrics_ar['losses'].append(accumulated_loss * config.gradient_accumulation)
-
-                accumulated_loss = 0
-
-                # Log
-                progress_bar.set_postfix({
-                    'loss': f"{training_metrics_ar['losses'][-1]:.4f}",
-                    'peak_layer': peak_conflict_layer,
-                    'max_conflict': f"{max(layer_conflicts.values()):.3f}"
-                })
-
-        # Optimizer step every gradient_accumulation steps
-        if (step + 1) % config.gradient_accumulation == 0:
-            # Gradient clipping
-            total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-            if torch.isnan(total_norm) or torch.isinf(total_norm):
-                print(f"\nWARNING: NaN gradients at step {step}, skipping update")
-                optimizer.zero_grad()
-            else:
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-
-        step += 1
-        progress_bar.update(1)
-
-        # Memory management and VRAM logging
-        if step % config.vram_log_interval == 0:
-            vram_monitor.log(step)
-
-        if step % 100 == 0:
-            torch.cuda.empty_cache()
-
-        # Checkpoint saving
-        if step > 0 and step % config.checkpoint_interval == 0:
-            checkpoint_manager.save_checkpoint(
-                stage='ar', step=step, model=model, optimizer=optimizer,
-                scheduler=scheduler, conflict_history=conflict_history_ar,
-                training_metrics=training_metrics_ar,
-                performance_tracking=performance_tracking
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
             )
 
-    progress_bar.close()
-    print("\n✓ Arabic training complete")
+            loss = outputs.loss / config.gradient_accumulation
 
-    # Evaluate after Arabic
-    print("\n" + "="*80)
-    print("EVALUATION AFTER ARABIC TRAINING")
-    print("="*80)
+            # Check for NaN loss before backward
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\nWARNING: NaN loss at step {step}, skipping batch")
+                step += 1
+                progress_bar.update(1)
+                continue
 
-    performance_tracking["after_ar"]["en"] = evaluate_on_test(
-        model, en_test_loader, "English", device, tokenizer
-    )
-    performance_tracking["after_ar"]["bn"] = evaluate_on_test(
-        model, bn_test_loader, "Bengali", device, tokenizer
-    )
-    performance_tracking["after_ar"]["ar"] = evaluate_on_test(
-        model, ar_test_loader, "Arabic", device, tokenizer
-    )
+            loss.backward()
+            accumulated_loss += loss.item()
 
-    print(f"EN Test - Loss: {performance_tracking['after_ar']['en']['loss']:.4f}, "
-          f"Perplexity: {performance_tracking['after_ar']['en']['perplexity']:.2f}")
-    print(f"BN Test - Loss: {performance_tracking['after_ar']['bn']['loss']:.4f}, "
-          f"Perplexity: {performance_tracking['after_ar']['bn']['perplexity']:.2f}")
-    print(f"AR Test - Loss: {performance_tracking['after_ar']['ar']['loss']:.4f}, "
-          f"Perplexity: {performance_tracking['after_ar']['ar']['perplexity']:.2f}")
+            # === CONFLICT MONITORING (DYNAMIC BASELINE - computes BN grad at CURRENT model state) ===
+            if step % config.log_interval == 0:
+                # Extract Arabic gradients directly from current backward pass
+                layer_grads = {}
+                for name, param in model.named_parameters():
+                    if param.grad is None:
+                        continue
 
-    # Save final checkpoint
-    checkpoint_manager.save_checkpoint(
-        stage='ar_complete', step=config.total_steps, model=model, optimizer=optimizer,
-        scheduler=scheduler, conflict_history=conflict_history_ar,
-        training_metrics=training_metrics_ar,
-        performance_tracking=performance_tracking
-    )
+                    # Track BOTH MLP and Attention layers
+                    if ".layers." in name and (".mlp." in name or ".self_attn." in name):
+                        try:
+                            parts = name.split(".layers.")[1].split(".")
+                            layer_num = int(parts[0])
+
+                            if layer_num in config.layers_to_track:
+                                if layer_num not in layer_grads:
+                                    layer_grads[layer_num] = []
+                                layer_grads[layer_num].append(param.grad.detach().clone().flatten())
+                        except (IndexError, ValueError):
+                            continue
+
+                # Concatenate gradients per layer
+                ar_layer_grads = {}
+                for layer, grads in layer_grads.items():
+                    if grads:
+                        ar_layer_grads[layer] = torch.cat(grads)
+
+                # MEMORY FIX: Clear Arabic forward pass memory BEFORE computing Bengali grads
+                del input_ids, attention_mask, labels, outputs, loss
+                model.zero_grad()
+                torch.cuda.empty_cache()
+
+                # CRITICAL FIX: Compute CURRENT Bengali gradient at this model state
+                # This measures TRUE interference, not comparison to frozen snapshot
+                current_bn_grads = compute_current_task_gradient(
+                    model, bn_dataloader, config.layers_to_track, device, tokenizer, num_batches=2
+                )
+
+                # If OOM occurred, skip conflict logging for this step (don't use bad data)
+                if current_bn_grads is None:
+                    training_metrics_ar['skipped_steps_oom'].append(step)
+                    accumulated_loss = 0
+                    continue
+
+                # Compute cosine similarity with DYNAMIC Bengali baseline
+                layer_conflicts = {}
+                for layer in config.layers_to_track:
+                    if layer in ar_layer_grads and layer in current_bn_grads:
+                        bn_grad = current_bn_grads[layer]
+                        ar_grad = ar_layer_grads[layer]
+
+                        # Skip if either gradient is a placeholder
+                        if bn_grad.numel() <= 1 or ar_grad.numel() <= 1:
+                            continue
+
+                        # Normalize gradients
+                        bn_grad_norm = F.normalize(bn_grad.unsqueeze(0), dim=1)
+                        ar_grad_norm = F.normalize(ar_grad.unsqueeze(0), dim=1)
+
+                        # Cosine similarity
+                        cos_sim = F.cosine_similarity(bn_grad_norm, ar_grad_norm).item()
+
+                        # Store conflict metrics
+                        conflict_history_ar[layer].append({
+                            'step': step,
+                            'cosine_similarity': cos_sim,
+                            'conflict_score': 1 - cos_sim,
+                            'ar_grad_norm': ar_grad.norm().item(),
+                            'bn_grad_norm': bn_grad.norm().item()
+                        })
+
+                        layer_conflicts[layer] = 1 - cos_sim
+
+                # Find peak conflict layer with significance testing
+                if layer_conflicts:
+                    # Sort conflicts by value
+                    sorted_conflicts = sorted(layer_conflicts.items(), key=lambda x: x[1], reverse=True)
+                    peak_layer, peak_val = sorted_conflicts[0]
+
+                    # Record peak and confidence
+                    if len(sorted_conflicts) > 1:
+                        second_layer, second_val = sorted_conflicts[1]
+                        peak_confidence = peak_val - second_val
+                    else:
+                        peak_confidence = peak_val
+
+                    training_metrics_ar['peak_conflict_layers'].append(peak_layer)
+                    training_metrics_ar['steps'].append(step)
+                    training_metrics_ar['losses'].append(accumulated_loss * config.gradient_accumulation)
+
+                    # Store confidence if tracking exists
+                    if 'peak_confidence' not in training_metrics_ar:
+                        training_metrics_ar['peak_confidence'] = []
+                    training_metrics_ar['peak_confidence'].append(peak_confidence)
+
+                    accumulated_loss = 0
+
+                    # Log
+                    progress_bar.set_postfix({
+                        'loss': f"{training_metrics_ar['losses'][-1]:.4f}",
+                        'peak_layer': peak_layer,
+                        'max_conflict': f"{max(layer_conflicts.values()):.3f}",
+                        'confidence': f"{peak_confidence:.3f}"
+                    })
+
+            # Optimizer step every gradient_accumulation steps
+            if (step + 1) % config.gradient_accumulation == 0:
+                # Gradient clipping
+                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+                if torch.isnan(total_norm) or torch.isinf(total_norm):
+                    print(f"\nWARNING: NaN gradients at step {step}, skipping update")
+                    optimizer.zero_grad()
+                else:
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+
+            step += 1
+            progress_bar.update(1)
+
+            # Memory management and VRAM logging
+            if step % config.vram_log_interval == 0:
+                vram_monitor.log(step)
+
+            if step % 100 == 0:
+                torch.cuda.empty_cache()
+
+            # Checkpoint saving
+            if step > 0 and step % config.checkpoint_interval == 0:
+                checkpoint_manager.save_checkpoint(
+                    stage='ar', step=step, model=model, optimizer=optimizer,
+                    scheduler=scheduler, conflict_history=conflict_history_ar,
+                    training_metrics=training_metrics_ar,
+                    performance_tracking=performance_tracking
+                )
+
+        progress_bar.close()
+        print("\n✓ Arabic training complete")
+
+        # Report any skipped steps
+        if training_metrics_ar['skipped_steps_oom']:
+            print(f"⚠️  {len(training_metrics_ar['skipped_steps_oom'])} conflict logging steps skipped due to OOM")
+            print(f"   Skipped at steps: {training_metrics_ar['skipped_steps_oom']}")
+
+        # Evaluate after Arabic
+        print("\n" + "="*80)
+        print("EVALUATION AFTER ARABIC TRAINING")
+        print("="*80)
+
+        # Test set evaluations
+        performance_tracking["after_ar"]["en_test"] = evaluate_on_test(
+            model, en_test_loader, "English Test", device, tokenizer
+        )
+        performance_tracking["after_ar"]["bn_test"] = evaluate_on_test(
+            model, bn_test_loader, "Bengali Test", device, tokenizer
+        )
+        performance_tracking["after_ar"]["ar_test"] = evaluate_on_test(
+            model, ar_test_loader, "Arabic Test", device, tokenizer
+        )
+        # Training set evaluations (for true forgetting measurement)
+        performance_tracking["after_ar"]["en_train"] = evaluate_on_test(
+            model, en_train_eval_loader, "English Train", device, tokenizer
+        )
+        performance_tracking["after_ar"]["bn_train"] = evaluate_on_test(
+            model, bn_train_eval_loader, "Bengali Train", device, tokenizer
+        )
+        performance_tracking["after_ar"]["ar_train"] = evaluate_on_test(
+            model, ar_train_eval_loader, "Arabic Train", device, tokenizer
+        )
+
+        print(f"EN Test  - Loss: {performance_tracking['after_ar']['en_test']['loss']:.4f}, "
+              f"Perplexity: {performance_tracking['after_ar']['en_test']['perplexity']:.2f}")
+        print(f"EN Train - Loss: {performance_tracking['after_ar']['en_train']['loss']:.4f}, "
+              f"Perplexity: {performance_tracking['after_ar']['en_train']['perplexity']:.2f}")
+        print(f"BN Test  - Loss: {performance_tracking['after_ar']['bn_test']['loss']:.4f}, "
+              f"Perplexity: {performance_tracking['after_ar']['bn_test']['perplexity']:.2f}")
+        print(f"BN Train - Loss: {performance_tracking['after_ar']['bn_train']['loss']:.4f}, "
+              f"Perplexity: {performance_tracking['after_ar']['bn_train']['perplexity']:.2f}")
+        print(f"AR Test  - Loss: {performance_tracking['after_ar']['ar_test']['loss']:.4f}, "
+              f"Perplexity: {performance_tracking['after_ar']['ar_test']['perplexity']:.2f}")
+        print(f"AR Train - Loss: {performance_tracking['after_ar']['ar_train']['loss']:.4f}, "
+              f"Perplexity: {performance_tracking['after_ar']['ar_train']['perplexity']:.2f}")
+
+        # Save final checkpoint
+        checkpoint_manager.save_checkpoint(
+            stage='ar_complete', step=config.total_steps, model=model, optimizer=optimizer,
+            scheduler=scheduler, conflict_history=conflict_history_ar,
+            training_metrics=training_metrics_ar,
+            performance_tracking=performance_tracking
+        )
 
     # ========================================================================
     # COMBINED VISUALIZATION
@@ -1330,7 +1608,13 @@ def main(args):
 
     high_variance_layers_bn = sorted(conflict_variance_bn.items(), key=lambda x: x[1], reverse=True)[:3]
 
+    # Data quality check
+    bn_skipped = len(training_metrics_bn.get('skipped_steps_oom', []))
+    bn_total_checkpoints = len(peak_layers_bn) + bn_skipped
+    bn_data_quality = ((bn_total_checkpoints - bn_skipped) / bn_total_checkpoints * 100) if bn_total_checkpoints > 0 else 100
+
     print(f"\n📊 KEY FINDINGS (EN→BN):")
+    print(f"  ├─ Data quality: {bn_data_quality:.0f}% ({bn_skipped} checkpoints skipped due to OOM)")
     print(f"  ├─ Peak conflict migrated {migrations_bn} times across {len(peak_layers_bn)} checkpoints")
     print(f"  ├─ {len(unique_peaks_bn)} unique layers experienced peak conflict")
     if peak_layers_bn:
@@ -1380,7 +1664,13 @@ def main(args):
 
     high_variance_layers_ar = sorted(conflict_variance_ar.items(), key=lambda x: x[1], reverse=True)[:3]
 
+    # Data quality check
+    ar_skipped = len(training_metrics_ar.get('skipped_steps_oom', []))
+    ar_total_checkpoints = len(peak_layers_ar) + ar_skipped
+    ar_data_quality = ((ar_total_checkpoints - ar_skipped) / ar_total_checkpoints * 100) if ar_total_checkpoints > 0 else 100
+
     print(f"\n📊 KEY FINDINGS (BN→AR):")
+    print(f"  ├─ Data quality: {ar_data_quality:.0f}% ({ar_skipped} checkpoints skipped due to OOM)")
     print(f"  ├─ Peak conflict migrated {migrations_ar} times across {len(peak_layers_ar)} checkpoints")
     print(f"  ├─ {len(unique_peaks_ar)} unique layers experienced peak conflict")
     if peak_layers_ar:
@@ -1433,72 +1723,80 @@ def main(args):
         print("   → Consider longer training, different language pairs, or architecture")
 
     # ========================================================================
-    # CATASTROPHIC FORGETTING ANALYSIS
+    # CATASTROPHIC FORGETTING ANALYSIS (Using TRAINING sets for TRUE forgetting)
     # ========================================================================
     print("\n" + "="*80)
     print("🔬 CATASTROPHIC FORGETTING ANALYSIS")
     print("="*80)
+    print("Note: TRUE forgetting = degradation on TRAINING data (not just test data)")
 
-    # Only analyze if we have the required data
-    has_en_data = 'after_en' in performance_tracking and 'en' in performance_tracking.get('after_en', {})
-    has_bn_data = 'after_bn' in performance_tracking and 'bn' in performance_tracking.get('after_bn', {})
-    has_ar_data = 'after_ar' in performance_tracking and 'ar' in performance_tracking.get('after_ar', {})
-    
-    if has_en_data and 'after_bn' in performance_tracking and 'en' in performance_tracking['after_bn']:
-        en_initial_ppl = performance_tracking['after_en']['en']['perplexity']
-        en_after_bn_ppl = performance_tracking['after_bn']['en']['perplexity']
-        en_bn_degradation = ((en_after_bn_ppl - en_initial_ppl) / en_initial_ppl) * 100
-        
+    # Check for training set data (preferred) or fall back to test data
+    has_en_train = 'after_en' in performance_tracking and 'en_train' in performance_tracking.get('after_en', {})
+    has_bn_train = 'after_bn' in performance_tracking and 'bn_train' in performance_tracking.get('after_bn', {})
+
+    train_degradations = []
+    test_degradations = []
+
+    # English forgetting analysis
+    if has_en_train and 'after_bn' in performance_tracking and 'en_train' in performance_tracking['after_bn']:
+        en_train_initial = performance_tracking['after_en']['en_train']['perplexity']
+        en_train_after_bn = performance_tracking['after_bn']['en_train']['perplexity']
+        en_train_bn_deg = ((en_train_after_bn - en_train_initial) / en_train_initial) * 100
+
+        en_test_initial = performance_tracking['after_en']['en_test']['perplexity']
+        en_test_after_bn = performance_tracking['after_bn']['en_test']['perplexity']
+        en_test_bn_deg = ((en_test_after_bn - en_test_initial) / en_test_initial) * 100
+
         print(f"\n📉 ENGLISH FORGETTING (EN→BN):")
-        print(f"  Initial (after EN): {en_initial_ppl:.2f}")
-        print(f"  After BN: {en_after_bn_ppl:.2f} ({en_bn_degradation:+.1f}%)")
-    
-    if has_en_data and 'after_ar' in performance_tracking and 'en' in performance_tracking['after_ar']:
-        en_initial_ppl = performance_tracking['after_en']['en']['perplexity']
-        en_final_ppl = performance_tracking['after_ar']['en']['perplexity']
-        en_total_degradation = ((en_final_ppl - en_initial_ppl) / en_initial_ppl) * 100
-        
-        if has_bn_data and 'en' in performance_tracking['after_bn']:
-            print(f"  After AR: {en_final_ppl:.2f} ({en_total_degradation:+.1f}% total)")
-        else:
-            print(f"\n📉 ENGLISH FORGETTING (EN→AR):")
-            print(f"  Initial (after EN): {en_initial_ppl:.2f}")
-            print(f"  After AR: {en_final_ppl:.2f} ({en_total_degradation:+.1f}%)")
+        print(f"  Train: {en_train_initial:.2f} → {en_train_after_bn:.2f} ({en_train_bn_deg:+.1f}%) [TRUE FORGETTING]")
+        print(f"  Test:  {en_test_initial:.2f} → {en_test_after_bn:.2f} ({en_test_bn_deg:+.1f}%) [generalization]")
 
-    if has_bn_data and 'after_ar' in performance_tracking and 'bn' in performance_tracking['after_ar']:
-        bn_initial_ppl = performance_tracking['after_bn']['bn']['perplexity']
-        bn_final_ppl = performance_tracking['after_ar']['bn']['perplexity']
-        bn_degradation = ((bn_final_ppl - bn_initial_ppl) / bn_initial_ppl) * 100
+        if 'after_ar' in performance_tracking and 'en_train' in performance_tracking['after_ar']:
+            en_train_final = performance_tracking['after_ar']['en_train']['perplexity']
+            en_train_total_deg = ((en_train_final - en_train_initial) / en_train_initial) * 100
+            en_test_final = performance_tracking['after_ar']['en_test']['perplexity']
+            en_test_total_deg = ((en_test_final - en_test_initial) / en_test_initial) * 100
+
+            print(f"  After AR Train: {en_train_final:.2f} ({en_train_total_deg:+.1f}% total)")
+            print(f"  After AR Test:  {en_test_final:.2f} ({en_test_total_deg:+.1f}% total)")
+            train_degradations.append(en_train_total_deg)
+            test_degradations.append(en_test_total_deg)
+
+    # Bengali forgetting analysis
+    if has_bn_train and 'after_ar' in performance_tracking and 'bn_train' in performance_tracking['after_ar']:
+        bn_train_initial = performance_tracking['after_bn']['bn_train']['perplexity']
+        bn_train_final = performance_tracking['after_ar']['bn_train']['perplexity']
+        bn_train_deg = ((bn_train_final - bn_train_initial) / bn_train_initial) * 100
+
+        bn_test_initial = performance_tracking['after_bn']['bn_test']['perplexity']
+        bn_test_final = performance_tracking['after_ar']['bn_test']['perplexity']
+        bn_test_deg = ((bn_test_final - bn_test_initial) / bn_test_initial) * 100
 
         print(f"\n📉 BENGALI FORGETTING (BN→AR):")
-        print(f"  Initial (after BN): {bn_initial_ppl:.2f}")
-        print(f"  After AR: {bn_final_ppl:.2f} ({bn_degradation:+.1f}%)")
+        print(f"  Train: {bn_train_initial:.2f} → {bn_train_final:.2f} ({bn_train_deg:+.1f}%) [TRUE FORGETTING]")
+        print(f"  Test:  {bn_test_initial:.2f} → {bn_test_final:.2f} ({bn_test_deg:+.1f}%) [generalization]")
+        train_degradations.append(bn_train_deg)
+        test_degradations.append(bn_test_deg)
 
-    # Calculate average forgetting if we have data
-    degradations = []
-    if has_en_data and 'after_ar' in performance_tracking and 'en' in performance_tracking['after_ar']:
-        en_initial_ppl = performance_tracking['after_en']['en']['perplexity']
-        en_final_ppl = performance_tracking['after_ar']['en']['perplexity']
-        en_total_degradation = ((en_final_ppl - en_initial_ppl) / en_initial_ppl) * 100
-        degradations.append(en_total_degradation)
-    
-    if has_bn_data and 'after_ar' in performance_tracking and 'bn' in performance_tracking['after_ar']:
-        bn_initial_ppl = performance_tracking['after_bn']['bn']['perplexity']
-        bn_final_ppl = performance_tracking['after_ar']['bn']['perplexity']
-        bn_degradation = ((bn_final_ppl - bn_initial_ppl) / bn_initial_ppl) * 100
-        degradations.append(bn_degradation)
+    # Summary
+    if train_degradations:
+        avg_train_deg = sum(train_degradations) / len(train_degradations)
+        avg_test_deg = sum(test_degradations) / len(test_degradations) if test_degradations else 0
 
-    if degradations:
-        avg_degradation = sum(degradations) / len(degradations)
-        print(f"\n🎯 BACKWARD TRANSFER (BWT):")
-        print(f"  Average forgetting: {avg_degradation:.1f}%")
+        print(f"\n🎯 BACKWARD TRANSFER (BWT) SUMMARY:")
+        print(f"  Average TRAIN forgetting: {avg_train_deg:.1f}% (TRUE catastrophic forgetting)")
+        print(f"  Average TEST degradation: {avg_test_deg:.1f}% (generalization loss)")
 
-        if avg_degradation > 10:
-            print(f"\n✅ CATASTROPHIC FORGETTING CONFIRMED (>10% degradation)")
+        if avg_train_deg > 10:
+            print(f"\n✅ CATASTROPHIC FORGETTING CONFIRMED (>10% train degradation)")
+            print(f"   → Model is overwriting previously learned knowledge")
             print(f"   → This validates the need for dynamic expert allocation")
+        elif avg_train_deg > 5:
+            print(f"\n⚠️  MODERATE FORGETTING (5-10% train degradation)")
+            print(f"   → Some knowledge overwriting occurring")
         else:
-            print(f"\n⚠️  Mild forgetting observed (<10% degradation)")
-            print(f"   → Static model may be more robust than expected")
+            print(f"\n✅ MINIMAL FORGETTING (<5% train degradation)")
+            print(f"   → Model retains previous knowledge well")
     else:
         print(f"\n⚠️  Insufficient data for forgetting analysis (stages may have been skipped)")
 
@@ -1541,7 +1839,9 @@ def main(args):
             'training_metrics': {
                 'steps': [int(s) for s in training_metrics_bn['steps']],
                 'losses': [float(l) for l in training_metrics_bn['losses']],
-                'peak_conflict_layers': [int(l) for l in training_metrics_bn['peak_conflict_layers']]
+                'peak_conflict_layers': [int(l) for l in training_metrics_bn['peak_conflict_layers']],
+                'skipped_steps_oom': [int(s) for s in training_metrics_bn.get('skipped_steps_oom', [])],
+                'data_quality_pct': float(bn_data_quality)
             },
             'conflict_variance': {str(k): float(v) for k, v in conflict_variance_bn.items()}
         },
@@ -1566,7 +1866,9 @@ def main(args):
             'training_metrics': {
                 'steps': [int(s) for s in training_metrics_ar['steps']],
                 'losses': [float(l) for l in training_metrics_ar['losses']],
-                'peak_conflict_layers': [int(l) for l in training_metrics_ar['peak_conflict_layers']]
+                'peak_conflict_layers': [int(l) for l in training_metrics_ar['peak_conflict_layers']],
+                'skipped_steps_oom': [int(s) for s in training_metrics_ar.get('skipped_steps_oom', [])],
+                'data_quality_pct': float(ar_data_quality)
             },
             'conflict_variance': {str(k): float(v) for k, v in conflict_variance_ar.items()}
         },
@@ -1613,6 +1915,7 @@ if __name__ == "__main__":
     parser.add_argument("--test", action="store_true", help="Run quick test (5 min)")
     parser.add_argument("--stage", choices=['en', 'bn', 'ar', 'full'], default='full',
                        help="Training stage to run")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     args = parser.parse_args()
-    
+
     main(args)
