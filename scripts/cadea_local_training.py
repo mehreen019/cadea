@@ -811,7 +811,117 @@ def main(args):
                 if english_baseline_grads[layer] is not None:
                     english_baseline_grads[layer] /= num_baseline_batches
             torch.save(english_baseline_grads, baseline_path)
-    
+
+    # ========================================================================
+    # EN-EN SANITY CHECK: Compute conflict between two English batch groups
+    # ========================================================================
+    # This validates whether cross-language conflict is real signal or noise
+    # Expected: EN-EN conflict < 0.3 → EN-BN 0.8+ is real signal ✅
+    #           EN-EN conflict > 0.6 → Gradients are naturally noisy ❌
+
+    print("\n" + "="*80)
+    print("EN-EN SANITY CHECK: Validating Gradient Conflict Baseline")
+    print("="*80)
+
+    # Split English data into two groups
+    en_group_a_grads = {layer: None for layer in config.layers_to_track}
+    en_group_b_grads = {layer: None for layer in config.layers_to_track}
+
+    # Use even batches for group A, odd batches for group B
+    num_sanity_batches = min(40, len(en_dataloader))  # 20 per group
+    group_a_count = 0
+    group_b_count = 0
+
+    print(f"Computing gradients from {num_sanity_batches} English batches (split into 2 groups)...")
+
+    for i, batch in enumerate(tqdm(en_dataloader, total=num_sanity_batches, desc="EN-EN sanity check")):
+        if i >= num_sanity_batches:
+            break
+
+        layer_grads, _ = extract_layer_gradients(model, batch, config.layers_to_track, device, tokenizer)
+        if layer_grads is None:
+            continue
+
+        # Alternate between groups
+        if i % 2 == 0:
+            for layer, grad in layer_grads.items():
+                if en_group_a_grads[layer] is None:
+                    en_group_a_grads[layer] = grad.clone()
+                else:
+                    en_group_a_grads[layer] += grad
+            group_a_count += 1
+        else:
+            for layer, grad in layer_grads.items():
+                if en_group_b_grads[layer] is None:
+                    en_group_b_grads[layer] = grad.clone()
+                else:
+                    en_group_b_grads[layer] += grad
+            group_b_count += 1
+
+        model.zero_grad()
+
+        if i % 10 == 0:
+            torch.cuda.empty_cache()
+
+    # Average each group
+    for layer in config.layers_to_track:
+        if en_group_a_grads[layer] is not None and group_a_count > 0:
+            en_group_a_grads[layer] /= group_a_count
+        if en_group_b_grads[layer] is not None and group_b_count > 0:
+            en_group_b_grads[layer] /= group_b_count
+
+    # Compute EN-EN conflict (cosine similarity between two English groups)
+    print(f"\n📊 EN-EN CONFLICT SCORES (lower = less noisy gradients):")
+    print("-" * 60)
+
+    en_en_conflicts = {}
+    for layer in config.layers_to_track:
+        if (en_group_a_grads[layer] is not None and
+            en_group_b_grads[layer] is not None and
+            en_group_a_grads[layer].numel() > 1 and
+            en_group_b_grads[layer].numel() > 1):
+
+            # Normalize and compute cosine similarity
+            grad_a_norm = F.normalize(en_group_a_grads[layer].unsqueeze(0), dim=1)
+            grad_b_norm = F.normalize(en_group_b_grads[layer].unsqueeze(0), dim=1)
+            cos_sim = F.cosine_similarity(grad_a_norm, grad_b_norm).item()
+            conflict_score = 1 - cos_sim
+            en_en_conflicts[layer] = conflict_score
+
+            print(f"  Layer {layer:2d}: conflict = {conflict_score:.4f}  (cos_sim = {cos_sim:.4f})")
+
+    # Summary statistics
+    if en_en_conflicts:
+        avg_en_en_conflict = np.mean(list(en_en_conflicts.values()))
+        max_en_en_conflict = max(en_en_conflicts.values())
+        min_en_en_conflict = min(en_en_conflicts.values())
+
+        print("-" * 60)
+        print(f"  Average EN-EN conflict: {avg_en_en_conflict:.4f}")
+        print(f"  Range: [{min_en_en_conflict:.4f}, {max_en_en_conflict:.4f}]")
+
+        # Interpretation
+        print("\n🔬 INTERPRETATION:")
+        if avg_en_en_conflict < 0.3:
+            print(f"  ✅ EN-EN conflict is LOW ({avg_en_en_conflict:.3f} < 0.3)")
+            print(f"     → Same-language gradients are consistent")
+            print(f"     → If EN-BN conflict > 0.8, it's REAL cross-lingual interference!")
+        elif avg_en_en_conflict < 0.6:
+            print(f"  ⚠️  EN-EN conflict is MODERATE ({avg_en_en_conflict:.3f})")
+            print(f"     → Some natural variance in gradients")
+            print(f"     → EN-BN conflict needs to be significantly higher to be meaningful")
+        else:
+            print(f"  ❌ EN-EN conflict is HIGH ({avg_en_en_conflict:.3f} > 0.6)")
+            print(f"     → Gradients are naturally noisy")
+            print(f"     → Cross-language conflict may not be distinguishable from noise")
+            print(f"     → Consider: larger batches, more accumulation steps, or gradient smoothing")
+
+    # Clean up sanity check tensors
+    del en_group_a_grads, en_group_b_grads
+    torch.cuda.empty_cache()
+
+    print("=" * 80 + "\n")
+
     # ========================================================================
     # STAGE 2: BENGALI TRAINING WITH CONFLICT MONITORING
     # ========================================================================
