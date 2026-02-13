@@ -282,6 +282,230 @@ class VRAMMonitor:
         print(f"  Peak reserved: {self.peak_reserved:.2f} GB")
 
 # ============================================================================
+# EMA TRACKER FOR SMOOTHING
+# ============================================================================
+class EMATracker:
+    """Exponential Moving Average tracker for smoothing noisy signals"""
+
+    def __init__(self, beta=0.9):
+        self.beta = beta
+        self.value = None
+
+    def update(self, new_value):
+        if self.value is None:
+            self.value = new_value
+        else:
+            self.value = self.beta * self.value + (1 - self.beta) * new_value
+        return self.value
+
+    def reset(self):
+        self.value = None
+
+# ============================================================================
+# CONFLICT MONITOR WITH NOISE FLOOR CALIBRATION
+# ============================================================================
+class ConflictMonitor:
+    """
+    Monitor gradient conflicts with noise floor subtraction and magnitude weighting.
+
+    Key features:
+    1. Calibrates noise floor using EN-EN conflict baseline
+    2. Computes Normalized Conflict Score (NCS) by subtracting noise floor
+    3. Computes allocation signal weighted by gradient magnitude
+    4. Uses EMA smoothing for stable peak detection
+    """
+
+    def __init__(self, layers_to_track, default_noise_floor=0.8, ema_beta=0.9, allocation_ema_beta=0.95):
+        self.layers_to_track = layers_to_track
+        self.default_noise_floor = default_noise_floor
+
+        # Noise floor per layer (calibrated from EN-EN)
+        self.noise_floor = {layer: default_noise_floor for layer in layers_to_track}
+        self.noise_calibrated = False
+
+        # EMA trackers for each layer
+        self.ema_conflict = {layer: EMATracker(beta=ema_beta) for layer in layers_to_track}
+        self.ema_en_norm = {layer: EMATracker(beta=ema_beta) for layer in layers_to_track}
+        self.ema_new_lang_norm = {layer: EMATracker(beta=ema_beta) for layer in layers_to_track}
+        self.ema_allocation = {layer: EMATracker(beta=allocation_ema_beta) for layer in layers_to_track}
+        self.ema_ncs = {layer: EMATracker(beta=ema_beta) for layer in layers_to_track}
+
+        # History for diagnostics
+        self.diagnostic_history = []
+
+    def calibrate_noise_floor_from_en_en_conflicts(self, en_en_conflicts):
+        """
+        Calibrate noise floor from pre-computed EN-EN conflicts.
+
+        Args:
+            en_en_conflicts: Dict mapping layer_idx -> EN-EN conflict score
+        """
+        for layer, conflict in en_en_conflicts.items():
+            if layer in self.layers_to_track:
+                self.noise_floor[layer] = conflict
+
+        self.noise_calibrated = True
+
+        # Validation
+        avg_noise = np.mean(list(self.noise_floor.values()))
+        print(f"✓ Noise floor calibrated from EN-EN conflicts")
+        print(f"  Average noise floor: {avg_noise:.4f}")
+        for layer in sorted(self.noise_floor.keys()):
+            print(f"  Layer {layer}: {self.noise_floor[layer]:.4f}")
+
+    def compute_normalized_conflict(self, raw_conflict, layer_idx):
+        """
+        Subtract noise floor to get Normalized Conflict Score (NCS).
+
+        NCS = (raw_conflict - baseline) / (2.0 - baseline)
+
+        Returns value in [0, 1] range representing TRUE excess conflict.
+        """
+        if not self.noise_calibrated:
+            # Fallback: use default noise floor
+            baseline = self.default_noise_floor
+        else:
+            baseline = self.noise_floor.get(layer_idx, self.default_noise_floor)
+
+        # Normalized Conflict Score
+        # Scale to [0, 1] where 0 = no excess conflict, 1 = maximum conflict
+        ncs = (raw_conflict - baseline) / (2.0 - baseline)
+        return max(0.0, ncs)  # Only positive excess conflict
+
+    def compute_allocation_signal(self, layer_idx, en_norm, new_lang_norm, normalized_conflict, lambda_weight=0.5):
+        """
+        Compute weighted allocation signal.
+
+        S_l = ||∇L_new||_l × (1 + λ × NCS_l)
+
+        Args:
+            layer_idx: Layer index
+            en_norm: English gradient norm for this layer
+            new_lang_norm: New language gradient norm for this layer
+            normalized_conflict: NCS value (noise-floor subtracted)
+            lambda_weight: Conflict modulation strength (0.5 recommended)
+
+        Returns:
+            Allocation signal value
+        """
+        # Primary signal: magnitude of new language gradient (necessity)
+        base_signal = new_lang_norm
+
+        # Modulation: boost if conflict exists (interference)
+        conflict_multiplier = 1 + lambda_weight * normalized_conflict
+
+        allocation_signal = base_signal * conflict_multiplier
+
+        return allocation_signal
+
+    def update_ema_trackers(self, layer_idx, raw_conflict, ncs, en_norm, new_lang_norm, allocation_signal):
+        """Update all EMA trackers for a layer"""
+        self.ema_conflict[layer_idx].update(raw_conflict)
+        self.ema_ncs[layer_idx].update(ncs)
+        self.ema_en_norm[layer_idx].update(en_norm)
+        self.ema_new_lang_norm[layer_idx].update(new_lang_norm)
+        self.ema_allocation[layer_idx].update(allocation_signal)
+
+    def get_smoothed_allocation_signals(self):
+        """Get current smoothed allocation signals for all layers"""
+        return {
+            layer: self.ema_allocation[layer].value
+            for layer in self.layers_to_track
+            if self.ema_allocation[layer].value is not None
+        }
+
+    def select_peak_layer_robust(self, allocation_signals=None, min_threshold=0.1):
+        """
+        Select peak layer using smoothed, weighted signals.
+
+        Only considers layers above threshold to avoid noise.
+
+        Args:
+            allocation_signals: Dict of layer -> signal (uses smoothed if None)
+            min_threshold: Minimum signal to consider a layer
+
+        Returns:
+            Peak layer index or None if no clear signal
+        """
+        if allocation_signals is None:
+            allocation_signals = self.get_smoothed_allocation_signals()
+
+        if not allocation_signals:
+            return None
+
+        # Filter to valid layers above threshold
+        valid_layers = {
+            layer: signal
+            for layer, signal in allocation_signals.items()
+            if signal is not None and signal > min_threshold
+        }
+
+        if not valid_layers:
+            return None
+
+        return max(valid_layers, key=valid_layers.get)
+
+    def log_diagnostic(self, step, layer_idx, raw_conflict, ncs, en_norm, new_lang_norm,
+                       allocation_signal, lambda_weight=0.5):
+        """Log comprehensive diagnostic data for a layer"""
+        diagnostic = {
+            'step': step,
+            'layer_idx': layer_idx,
+
+            # Raw signals
+            'raw_conflict': float(raw_conflict),
+            'raw_en_norm': float(en_norm),
+            'raw_new_lang_norm': float(new_lang_norm),
+
+            # Processed signals
+            'noise_floor': float(self.noise_floor.get(layer_idx, self.default_noise_floor)),
+            'normalized_conflict_score': float(ncs),
+            'allocation_signal': float(allocation_signal),
+
+            # Smoothed signals
+            'ema_conflict': float(self.ema_conflict[layer_idx].value) if self.ema_conflict[layer_idx].value else None,
+            'ema_ncs': float(self.ema_ncs[layer_idx].value) if self.ema_ncs[layer_idx].value else None,
+            'ema_en_norm': float(self.ema_en_norm[layer_idx].value) if self.ema_en_norm[layer_idx].value else None,
+            'ema_new_lang_norm': float(self.ema_new_lang_norm[layer_idx].value) if self.ema_new_lang_norm[layer_idx].value else None,
+            'ema_allocation': float(self.ema_allocation[layer_idx].value) if self.ema_allocation[layer_idx].value else None,
+
+            # Ratios for analysis
+            'norm_ratio_new_to_en': float(new_lang_norm / (en_norm + 1e-8)),
+            'conflict_contribution': float(lambda_weight * ncs),
+        }
+
+        self.diagnostic_history.append(diagnostic)
+        return diagnostic
+
+    def get_validation_checks(self):
+        """Return validation check results"""
+        checks = {}
+
+        # Check noise floor is in expected range
+        noise_values = list(self.noise_floor.values())
+        checks['noise_floor_valid'] = all(0.5 <= nf <= 0.95 for nf in noise_values)
+        checks['noise_floor_avg'] = np.mean(noise_values)
+
+        # Check for smoothed signal availability
+        allocation_values = [v.value for v in self.ema_allocation.values() if v.value is not None]
+        if allocation_values:
+            checks['allocation_range'] = (min(allocation_values), max(allocation_values))
+            checks['allocation_ratio'] = max(allocation_values) / (min(allocation_values) + 1e-8)
+
+        return checks
+
+    def reset_for_new_stage(self):
+        """Reset EMA trackers for a new training stage"""
+        for layer in self.layers_to_track:
+            self.ema_conflict[layer].reset()
+            self.ema_ncs[layer].reset()
+            self.ema_en_norm[layer].reset()
+            self.ema_new_lang_norm[layer].reset()
+            self.ema_allocation[layer].reset()
+
+        self.diagnostic_history = []
+
+# ============================================================================
 # HELPER FUNCTIONS (Same as before)
 # ============================================================================
 def prepare_dataset(dataset_name, num_samples, max_length, tokenizer):
@@ -923,6 +1147,36 @@ def main(args):
     print("=" * 80 + "\n")
 
     # ========================================================================
+    # INITIALIZE CONFLICT MONITOR WITH NOISE FLOOR CALIBRATION
+    # ========================================================================
+    print("=" * 80)
+    print("INITIALIZING CONFLICT MONITOR WITH NOISE FLOOR CALIBRATION")
+    print("=" * 80)
+
+    conflict_monitor = ConflictMonitor(
+        layers_to_track=config.layers_to_track,
+        default_noise_floor=0.8,
+        ema_beta=0.9,
+        allocation_ema_beta=0.95
+    )
+
+    # Calibrate noise floor from EN-EN conflicts computed above
+    if en_en_conflicts:
+        conflict_monitor.calibrate_noise_floor_from_en_en_conflicts(en_en_conflicts)
+
+        # Validation checks
+        validation = conflict_monitor.get_validation_checks()
+        if validation['noise_floor_valid']:
+            print(f"✓ Noise floor validation PASSED (avg: {validation['noise_floor_avg']:.4f})")
+        else:
+            print(f"⚠️  Noise floor validation WARNING (avg: {validation['noise_floor_avg']:.4f})")
+            print(f"   Expected range: [0.5, 0.95] - consider more EN-EN batches")
+    else:
+        print("⚠️  No EN-EN conflicts computed, using default noise floor (0.8)")
+
+    print("=" * 80 + "\n")
+
+    # ========================================================================
     # STAGE 2: BENGALI TRAINING WITH CONFLICT MONITORING
     # ========================================================================
     skip_bn = resume_stage in ['bn_complete', 'ar', 'ar_complete']
@@ -1043,8 +1297,12 @@ def main(args):
                     accumulated_loss = 0
                     continue
 
-                # Compute cosine similarity with DYNAMIC English baseline
+                # Compute conflict with NOISE FLOOR SUBTRACTION and MAGNITUDE WEIGHTING
                 layer_conflicts = {}
+                layer_ncs = {}  # Normalized Conflict Scores
+                layer_allocation_signals = {}
+                lambda_weight = 0.5  # Conflict modulation strength
+
                 for layer in config.layers_to_track:
                     if layer in bn_layer_grads and layer in current_en_grads:
                         en_grad = current_en_grads[layer]
@@ -1054,55 +1312,127 @@ def main(args):
                         if en_grad.numel() <= 1 or bn_grad.numel() <= 1:
                             continue
 
-                        # Normalize gradients
-                        en_grad_norm = F.normalize(en_grad.unsqueeze(0), dim=1)
-                        bn_grad_norm = F.normalize(bn_grad.unsqueeze(0), dim=1)
+                        # Compute gradient norms (magnitude)
+                        en_norm = en_grad.norm().item()
+                        bn_norm = bn_grad.norm().item()
 
-                        # Cosine similarity
-                        cos_sim = F.cosine_similarity(en_grad_norm, bn_grad_norm).item()
+                        # Normalize gradients for angle computation
+                        en_grad_normalized = F.normalize(en_grad.unsqueeze(0), dim=1)
+                        bn_grad_normalized = F.normalize(bn_grad.unsqueeze(0), dim=1)
 
-                        # Store conflict metrics
+                        # Cosine similarity and raw conflict
+                        cos_sim = F.cosine_similarity(en_grad_normalized, bn_grad_normalized).item()
+                        raw_conflict = 1 - cos_sim
+
+                        # Compute Normalized Conflict Score (subtract noise floor)
+                        ncs = conflict_monitor.compute_normalized_conflict(raw_conflict, layer)
+                        layer_ncs[layer] = ncs
+
+                        # Compute allocation signal (magnitude-weighted)
+                        allocation_signal = conflict_monitor.compute_allocation_signal(
+                            layer_idx=layer,
+                            en_norm=en_norm,
+                            new_lang_norm=bn_norm,
+                            normalized_conflict=ncs,
+                            lambda_weight=lambda_weight
+                        )
+                        layer_allocation_signals[layer] = allocation_signal
+
+                        # Update EMA trackers
+                        conflict_monitor.update_ema_trackers(
+                            layer_idx=layer,
+                            raw_conflict=raw_conflict,
+                            ncs=ncs,
+                            en_norm=en_norm,
+                            new_lang_norm=bn_norm,
+                            allocation_signal=allocation_signal
+                        )
+
+                        # Log diagnostic data
+                        conflict_monitor.log_diagnostic(
+                            step=step,
+                            layer_idx=layer,
+                            raw_conflict=raw_conflict,
+                            ncs=ncs,
+                            en_norm=en_norm,
+                            new_lang_norm=bn_norm,
+                            allocation_signal=allocation_signal,
+                            lambda_weight=lambda_weight
+                        )
+
+                        # Store comprehensive conflict metrics
                         conflict_history_bn[layer].append({
                             'step': step,
                             'cosine_similarity': cos_sim,
-                            'conflict_score': 1 - cos_sim,
-                            'bn_grad_norm': bn_grad.norm().item(),
-                            'en_grad_norm': en_grad.norm().item()
+                            'conflict_score': raw_conflict,
+                            'normalized_conflict_score': ncs,
+                            'allocation_signal': allocation_signal,
+                            'bn_grad_norm': bn_norm,
+                            'en_grad_norm': en_norm,
+                            'noise_floor': conflict_monitor.noise_floor.get(layer, 0.8),
+                            'ema_ncs': conflict_monitor.ema_ncs[layer].value,
+                            'ema_allocation': conflict_monitor.ema_allocation[layer].value,
+                            'norm_ratio_bn_to_en': bn_norm / (en_norm + 1e-8),
                         })
 
-                        layer_conflicts[layer] = 1 - cos_sim
+                        layer_conflicts[layer] = raw_conflict
 
-                # Find peak conflict layer with significance testing
-                if layer_conflicts:
-                    # Sort conflicts by value
-                    sorted_conflicts = sorted(layer_conflicts.items(), key=lambda x: x[1], reverse=True)
-                    peak_layer, peak_val = sorted_conflicts[0]
+                # Find peak layer using SMOOTHED ALLOCATION SIGNALS (not raw conflict)
+                if layer_allocation_signals:
+                    # Use smoothed allocation signals for robust peak selection
+                    smoothed_signals = conflict_monitor.get_smoothed_allocation_signals()
 
-                    # Record peak and confidence
-                    if len(sorted_conflicts) > 1:
-                        second_layer, second_val = sorted_conflicts[1]
-                        peak_confidence = peak_val - second_val
-                    else:
-                        peak_confidence = peak_val
+                    # For early steps when EMA isn't populated, use raw signals
+                    if not smoothed_signals or all(v is None for v in smoothed_signals.values()):
+                        smoothed_signals = layer_allocation_signals
 
-                    training_metrics_bn['peak_conflict_layers'].append(peak_layer)
-                    training_metrics_bn['steps'].append(step)
-                    training_metrics_bn['losses'].append(accumulated_loss * config.gradient_accumulation)
+                    peak_layer = conflict_monitor.select_peak_layer_robust(
+                        allocation_signals=smoothed_signals,
+                        min_threshold=0.01  # Lower threshold for early training
+                    )
 
-                    # Store confidence if tracking exists
-                    if 'peak_confidence' not in training_metrics_bn:
-                        training_metrics_bn['peak_confidence'] = []
-                    training_metrics_bn['peak_confidence'].append(peak_confidence)
+                    # Fallback to raw max if no valid peak
+                    if peak_layer is None and layer_allocation_signals:
+                        peak_layer = max(layer_allocation_signals, key=layer_allocation_signals.get)
 
-                    accumulated_loss = 0
+                    if peak_layer is not None:
+                        peak_allocation = smoothed_signals.get(peak_layer, layer_allocation_signals.get(peak_layer, 0))
+                        max_ncs = max(layer_ncs.values()) if layer_ncs else 0
 
-                    # Log
-                    progress_bar.set_postfix({
-                        'loss': f"{training_metrics_bn['losses'][-1]:.4f}",
-                        'peak_layer': peak_layer,
-                        'max_conflict': f"{max(layer_conflicts.values()):.3f}",
-                        'confidence': f"{peak_confidence:.3f}"
-                    })
+                        # Compute confidence as ratio of peak to second highest
+                        sorted_signals = sorted(smoothed_signals.items(), key=lambda x: x[1] if x[1] else 0, reverse=True)
+                        if len(sorted_signals) > 1 and sorted_signals[1][1]:
+                            peak_confidence = sorted_signals[0][1] / (sorted_signals[1][1] + 1e-8)
+                        else:
+                            peak_confidence = 1.0
+
+                        training_metrics_bn['peak_conflict_layers'].append(peak_layer)
+                        training_metrics_bn['steps'].append(step)
+                        training_metrics_bn['losses'].append(accumulated_loss * config.gradient_accumulation)
+
+                        # Store additional metrics
+                        if 'peak_confidence' not in training_metrics_bn:
+                            training_metrics_bn['peak_confidence'] = []
+                        training_metrics_bn['peak_confidence'].append(peak_confidence)
+
+                        if 'peak_allocation_signal' not in training_metrics_bn:
+                            training_metrics_bn['peak_allocation_signal'] = []
+                        training_metrics_bn['peak_allocation_signal'].append(peak_allocation)
+
+                        if 'max_ncs' not in training_metrics_bn:
+                            training_metrics_bn['max_ncs'] = []
+                        training_metrics_bn['max_ncs'].append(max_ncs)
+
+                        accumulated_loss = 0
+
+                        # Log with new metrics
+                        progress_bar.set_postfix({
+                            'loss': f"{training_metrics_bn['losses'][-1]:.4f}",
+                            'peak_L': peak_layer,
+                            'max_NCS': f"{max_ncs:.3f}",
+                            'alloc': f"{peak_allocation:.2e}",
+                            'conf': f"{peak_confidence:.2f}"
+                        })
 
             # Optimizer step every gradient_accumulation steps
             if (step + 1) % config.gradient_accumulation == 0:
@@ -1289,6 +1619,10 @@ def main(args):
     }
 
     if not skip_ar:
+        # Reset ConflictMonitor EMA trackers for new stage
+        conflict_monitor.reset_for_new_stage()
+        print("✓ ConflictMonitor reset for Arabic stage (EMA trackers cleared)")
+
         # RE-INITIALIZE optimizer (fresh training phase)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
         scheduler = get_linear_schedule_with_warmup(
@@ -1382,8 +1716,12 @@ def main(args):
                     accumulated_loss = 0
                     continue
 
-                # Compute cosine similarity with DYNAMIC Bengali baseline
+                # Compute conflict with NOISE FLOOR SUBTRACTION and MAGNITUDE WEIGHTING
                 layer_conflicts = {}
+                layer_ncs = {}  # Normalized Conflict Scores
+                layer_allocation_signals = {}
+                lambda_weight = 0.5  # Conflict modulation strength
+
                 for layer in config.layers_to_track:
                     if layer in ar_layer_grads and layer in current_bn_grads:
                         bn_grad = current_bn_grads[layer]
@@ -1393,55 +1731,128 @@ def main(args):
                         if bn_grad.numel() <= 1 or ar_grad.numel() <= 1:
                             continue
 
-                        # Normalize gradients
-                        bn_grad_norm = F.normalize(bn_grad.unsqueeze(0), dim=1)
-                        ar_grad_norm = F.normalize(ar_grad.unsqueeze(0), dim=1)
+                        # Compute gradient norms (magnitude)
+                        bn_norm = bn_grad.norm().item()
+                        ar_norm = ar_grad.norm().item()
 
-                        # Cosine similarity
-                        cos_sim = F.cosine_similarity(bn_grad_norm, ar_grad_norm).item()
+                        # Normalize gradients for angle computation
+                        bn_grad_normalized = F.normalize(bn_grad.unsqueeze(0), dim=1)
+                        ar_grad_normalized = F.normalize(ar_grad.unsqueeze(0), dim=1)
 
-                        # Store conflict metrics
+                        # Cosine similarity and raw conflict
+                        cos_sim = F.cosine_similarity(bn_grad_normalized, ar_grad_normalized).item()
+                        raw_conflict = 1 - cos_sim
+
+                        # Compute Normalized Conflict Score (subtract noise floor)
+                        ncs = conflict_monitor.compute_normalized_conflict(raw_conflict, layer)
+                        layer_ncs[layer] = ncs
+
+                        # Compute allocation signal (magnitude-weighted)
+                        # For AR stage, AR is the "new" language, BN is the "existing" language
+                        allocation_signal = conflict_monitor.compute_allocation_signal(
+                            layer_idx=layer,
+                            en_norm=bn_norm,  # BN acts as "existing" language in this stage
+                            new_lang_norm=ar_norm,
+                            normalized_conflict=ncs,
+                            lambda_weight=lambda_weight
+                        )
+                        layer_allocation_signals[layer] = allocation_signal
+
+                        # Update EMA trackers
+                        conflict_monitor.update_ema_trackers(
+                            layer_idx=layer,
+                            raw_conflict=raw_conflict,
+                            ncs=ncs,
+                            en_norm=bn_norm,
+                            new_lang_norm=ar_norm,
+                            allocation_signal=allocation_signal
+                        )
+
+                        # Log diagnostic data
+                        conflict_monitor.log_diagnostic(
+                            step=step,
+                            layer_idx=layer,
+                            raw_conflict=raw_conflict,
+                            ncs=ncs,
+                            en_norm=bn_norm,
+                            new_lang_norm=ar_norm,
+                            allocation_signal=allocation_signal,
+                            lambda_weight=lambda_weight
+                        )
+
+                        # Store comprehensive conflict metrics
                         conflict_history_ar[layer].append({
                             'step': step,
                             'cosine_similarity': cos_sim,
-                            'conflict_score': 1 - cos_sim,
-                            'ar_grad_norm': ar_grad.norm().item(),
-                            'bn_grad_norm': bn_grad.norm().item()
+                            'conflict_score': raw_conflict,
+                            'normalized_conflict_score': ncs,
+                            'allocation_signal': allocation_signal,
+                            'ar_grad_norm': ar_norm,
+                            'bn_grad_norm': bn_norm,
+                            'noise_floor': conflict_monitor.noise_floor.get(layer, 0.8),
+                            'ema_ncs': conflict_monitor.ema_ncs[layer].value,
+                            'ema_allocation': conflict_monitor.ema_allocation[layer].value,
+                            'norm_ratio_ar_to_bn': ar_norm / (bn_norm + 1e-8),
                         })
 
-                        layer_conflicts[layer] = 1 - cos_sim
+                        layer_conflicts[layer] = raw_conflict
 
-                # Find peak conflict layer with significance testing
-                if layer_conflicts:
-                    # Sort conflicts by value
-                    sorted_conflicts = sorted(layer_conflicts.items(), key=lambda x: x[1], reverse=True)
-                    peak_layer, peak_val = sorted_conflicts[0]
+                # Find peak layer using SMOOTHED ALLOCATION SIGNALS (not raw conflict)
+                if layer_allocation_signals:
+                    # Use smoothed allocation signals for robust peak selection
+                    smoothed_signals = conflict_monitor.get_smoothed_allocation_signals()
 
-                    # Record peak and confidence
-                    if len(sorted_conflicts) > 1:
-                        second_layer, second_val = sorted_conflicts[1]
-                        peak_confidence = peak_val - second_val
-                    else:
-                        peak_confidence = peak_val
+                    # For early steps when EMA isn't populated, use raw signals
+                    if not smoothed_signals or all(v is None for v in smoothed_signals.values()):
+                        smoothed_signals = layer_allocation_signals
 
-                    training_metrics_ar['peak_conflict_layers'].append(peak_layer)
-                    training_metrics_ar['steps'].append(step)
-                    training_metrics_ar['losses'].append(accumulated_loss * config.gradient_accumulation)
+                    peak_layer = conflict_monitor.select_peak_layer_robust(
+                        allocation_signals=smoothed_signals,
+                        min_threshold=0.01  # Lower threshold for early training
+                    )
 
-                    # Store confidence if tracking exists
-                    if 'peak_confidence' not in training_metrics_ar:
-                        training_metrics_ar['peak_confidence'] = []
-                    training_metrics_ar['peak_confidence'].append(peak_confidence)
+                    # Fallback to raw max if no valid peak
+                    if peak_layer is None and layer_allocation_signals:
+                        peak_layer = max(layer_allocation_signals, key=layer_allocation_signals.get)
 
-                    accumulated_loss = 0
+                    if peak_layer is not None:
+                        peak_allocation = smoothed_signals.get(peak_layer, layer_allocation_signals.get(peak_layer, 0))
+                        max_ncs = max(layer_ncs.values()) if layer_ncs else 0
 
-                    # Log
-                    progress_bar.set_postfix({
-                        'loss': f"{training_metrics_ar['losses'][-1]:.4f}",
-                        'peak_layer': peak_layer,
-                        'max_conflict': f"{max(layer_conflicts.values()):.3f}",
-                        'confidence': f"{peak_confidence:.3f}"
-                    })
+                        # Compute confidence as ratio of peak to second highest
+                        sorted_signals = sorted(smoothed_signals.items(), key=lambda x: x[1] if x[1] else 0, reverse=True)
+                        if len(sorted_signals) > 1 and sorted_signals[1][1]:
+                            peak_confidence = sorted_signals[0][1] / (sorted_signals[1][1] + 1e-8)
+                        else:
+                            peak_confidence = 1.0
+
+                        training_metrics_ar['peak_conflict_layers'].append(peak_layer)
+                        training_metrics_ar['steps'].append(step)
+                        training_metrics_ar['losses'].append(accumulated_loss * config.gradient_accumulation)
+
+                        # Store additional metrics
+                        if 'peak_confidence' not in training_metrics_ar:
+                            training_metrics_ar['peak_confidence'] = []
+                        training_metrics_ar['peak_confidence'].append(peak_confidence)
+
+                        if 'peak_allocation_signal' not in training_metrics_ar:
+                            training_metrics_ar['peak_allocation_signal'] = []
+                        training_metrics_ar['peak_allocation_signal'].append(peak_allocation)
+
+                        if 'max_ncs' not in training_metrics_ar:
+                            training_metrics_ar['max_ncs'] = []
+                        training_metrics_ar['max_ncs'].append(max_ncs)
+
+                        accumulated_loss = 0
+
+                        # Log with new metrics
+                        progress_bar.set_postfix({
+                            'loss': f"{training_metrics_ar['losses'][-1]:.4f}",
+                            'peak_L': peak_layer,
+                            'max_NCS': f"{max_ncs:.3f}",
+                            'alloc': f"{peak_allocation:.2e}",
+                            'conf': f"{peak_confidence:.2f}"
+                        })
 
             # Optimizer step every gradient_accumulation steps
             if (step + 1) % config.gradient_accumulation == 0:
@@ -1956,6 +2367,14 @@ def main(args):
     print("EXPORTING RESULTS")
     print("="*80)
 
+    # Helper to safely convert values for JSON
+    def safe_float(v):
+        if v is None:
+            return None
+        if isinstance(v, (int, float, np.number)):
+            return float(v)
+        return v
+
     results = {
         'config': {
             'model': config.model_name,
@@ -1966,6 +2385,15 @@ def main(args):
             'learning_rate': config.learning_rate,
             'batch_size': config.batch_size,
             'gradient_accumulation': config.gradient_accumulation
+        },
+
+        # Noise floor calibration data (from EN-EN sanity check)
+        'noise_floor_calibration': {
+            'calibrated': conflict_monitor.noise_calibrated,
+            'noise_floor_per_layer': {str(k): float(v) for k, v in conflict_monitor.noise_floor.items()},
+            'average_noise_floor': float(np.mean(list(conflict_monitor.noise_floor.values()))),
+            'en_en_conflicts': {str(k): float(v) for k, v in en_en_conflicts.items()} if en_en_conflicts else {},
+            'validation': conflict_monitor.get_validation_checks()
         },
 
         'stage_1_en_bn': {
@@ -1979,7 +2407,7 @@ def main(args):
             },
             'conflict_history': {
                 str(layer): [
-                    {k: float(v) if isinstance(v, (int, float, np.number)) else int(v)
+                    {k: safe_float(v) if not isinstance(v, int) else int(v)
                      for k, v in h.items()}
                     for h in history
                 ]
@@ -1990,7 +2418,11 @@ def main(args):
                 'losses': [float(l) for l in training_metrics_bn['losses']],
                 'peak_conflict_layers': [int(l) for l in training_metrics_bn['peak_conflict_layers']],
                 'skipped_steps_oom': [int(s) for s in training_metrics_bn.get('skipped_steps_oom', [])],
-                'data_quality_pct': float(bn_data_quality)
+                'data_quality_pct': float(bn_data_quality),
+                # New NCS and allocation signal metrics
+                'peak_allocation_signal': [float(s) for s in training_metrics_bn.get('peak_allocation_signal', [])],
+                'max_ncs': [float(n) for n in training_metrics_bn.get('max_ncs', [])],
+                'peak_confidence': [float(c) for c in training_metrics_bn.get('peak_confidence', [])]
             },
             'conflict_variance': {str(k): float(v) for k, v in conflict_variance_bn.items()}
         },
@@ -2006,7 +2438,7 @@ def main(args):
             },
             'conflict_history': {
                 str(layer): [
-                    {k: float(v) if isinstance(v, (int, float, np.number)) else int(v)
+                    {k: safe_float(v) if not isinstance(v, int) else int(v)
                      for k, v in h.items()}
                     for h in history
                 ]
@@ -2017,7 +2449,11 @@ def main(args):
                 'losses': [float(l) for l in training_metrics_ar['losses']],
                 'peak_conflict_layers': [int(l) for l in training_metrics_ar['peak_conflict_layers']],
                 'skipped_steps_oom': [int(s) for s in training_metrics_ar.get('skipped_steps_oom', [])],
-                'data_quality_pct': float(ar_data_quality)
+                'data_quality_pct': float(ar_data_quality),
+                # New NCS and allocation signal metrics
+                'peak_allocation_signal': [float(s) for s in training_metrics_ar.get('peak_allocation_signal', [])],
+                'max_ncs': [float(n) for n in training_metrics_ar.get('max_ncs', [])],
+                'peak_confidence': [float(c) for c in training_metrics_ar.get('peak_confidence', [])]
             },
             'conflict_variance': {str(k): float(v) for k, v in conflict_variance_ar.items()}
         },
@@ -2035,7 +2471,10 @@ def main(args):
                 for lang, metrics in langs.items()
             }
             for stage, langs in performance_tracking.items()
-        }
+        },
+
+        # Full diagnostic history from ConflictMonitor
+        'diagnostic_history': conflict_monitor.diagnostic_history
     }
 
     results_path = results_dir / 'cadea_sequential_transfer_data.json'
@@ -2054,6 +2493,21 @@ def main(args):
         }
         json.dump(tracking_serializable, f, indent=2)
     print(f"✓ Performance tracking saved to: {performance_path}")
+
+    # Export detailed diagnostics for post-hoc analysis
+    diagnostics_path = results_dir / 'conflict_diagnostics.json'
+    diagnostics_data = {
+        'noise_floor': {str(k): float(v) for k, v in conflict_monitor.noise_floor.items()},
+        'calibrated': conflict_monitor.noise_calibrated,
+        'diagnostic_history': conflict_monitor.diagnostic_history,
+        'summary': {
+            'total_diagnostic_entries': len(conflict_monitor.diagnostic_history),
+            'average_noise_floor': float(np.mean(list(conflict_monitor.noise_floor.values()))),
+        }
+    }
+    with open(diagnostics_path, 'w') as f:
+        json.dump(diagnostics_data, f, indent=2)
+    print(f"✓ Conflict diagnostics saved to: {diagnostics_path}")
 
     vram_monitor.summary()
     print(f"\n🎉 Training complete! Checkpoints in: {config.checkpoint_dir}")
